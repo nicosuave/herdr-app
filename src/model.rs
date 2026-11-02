@@ -63,6 +63,11 @@ pub struct Agent {
     pub app: Option<String>,
     /// Whether the person has seen it since it last stopped working.
     pub seen: bool,
+    /// Core's turn counter: goes up each time it stops working.
+    pub turn: u64,
+    /// The last turn a person looked at on any client (`herdr.seen`, docs/labels.md).
+    /// None: no client shares it yet, so `seen` decides.
+    pub seen_turn: Option<u64>,
     /// Bumped on every state change (for "most recent" ordering).
     pub seq: u64,
     /// When the state last changed, ms since the epoch (0: not since the app started).
@@ -235,11 +240,17 @@ impl Model {
         if !p.name.is_empty() {
             return p.name.clone();
         }
+        folder_name(&self.space_folder(p), home)
+    }
+
+    /// Where a space is now: its first terminal's folder (a worktree's own
+    /// folder, else the folder), else the folder it was made in.
+    pub fn space_folder(&self, p: &Space) -> String {
         let first = p.tabs.iter().flat_map(|c| c.root.terminals()).next();
         let folder = first
             .and_then(|n| n.terminal().and_then(|a| self.folder_info.get(a)).map(|f| f.top.clone()).or_else(|| self.pane_folders.get(&n.id).cloned()))
             .unwrap_or_else(|| p.folder.clone());
-        folder_name(&folder, home)
+        folder
     }
 
     /// What a tab is called: its name, else its place in its space (1, 2, ...).
@@ -429,11 +440,6 @@ impl Model {
         self.tabs().flat_map(|c| addresses(&c.root)).collect()
     }
 
-    /// Which terminals the person is looking at: the selected tab's.
-    pub fn visible_addresses(&self) -> Vec<String> {
-        self.active_tab().map(|c| addresses(c.shown())).unwrap_or_default()
-    }
-
     /// Applies a status word from core (Herdr's seen rules).
     pub fn set_word(&mut self, address: &str, word: Option<String>, app: Option<String>, looking: bool) -> bool {
         let a = self.agents.entry(address.to_owned()).or_insert_with(|| Agent { seen: true, ..Default::default() });
@@ -493,13 +499,21 @@ impl Model {
         changed
     }
 
+    /// Core's turn and the shared seen turn for an agent; true when either changed.
+    pub fn set_turn(&mut self, address: &str, turn: u64, seen_turn: Option<u64>) -> bool {
+        let Some(a) = self.agents.get_mut(address) else { return false };
+        let changed = (a.turn, a.seen_turn) != (turn, seen_turn);
+        (a.turn, a.seen_turn) = (turn, seen_turn);
+        changed
+    }
+
     /// What the UI shows: working, blocked, done (finished, unseen), idle, or None (not an agent).
     pub fn status(&self, address: &str) -> Option<&'static str> {
         let a = self.agents.get(address)?;
         Some(match a.word.as_deref()? {
             "working" => "working",
             "blocked" | "error" => "blocked",
-            _ if !a.seen => "done",
+            _ if a.seen_turn.map_or(!a.seen, |s| a.turn > s) => "done",
             _ => "idle",
         })
     }
@@ -593,7 +607,9 @@ pub fn space_json(m: &Model, p: &Space, index: usize, branch: Option<&str>, home
         "index": index + 1,
         "name": m.space_name(p, home),
         "named": !p.name.is_empty(),
-        "folder": p.folder,
+        // A space adopted before its core knew a folder ("") tells mods where
+        // its terminals are, not that it has no folder.
+        "folder": if p.folder.is_empty() { m.space_folder(p) } else { p.folder.clone() },
         "machine": p.machine,
         "branch": branch,
         "active": m.active.as_deref() == Some(&p.id),
@@ -828,6 +844,30 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_seen_turn_decides_over_this_screen() {
+        let mut m = model_with_one();
+        m.set_word("t1", Some("working".into()), None, true);
+        m.set_word("t1", Some("idle".into()), None, true);
+        assert_eq!(m.status("t1"), Some("idle"));
+        // Another client hasn't seen turn 3 (marked unread): done, though we watched.
+        assert!(m.set_turn("t1", 3, Some(2)));
+        assert_eq!(m.status("t1"), Some("done"));
+        assert!(!m.set_turn("t1", 3, Some(2)));
+        // Seen elsewhere: idle, though we didn't watch.
+        m.set_word("t1", Some("working".into()), None, false);
+        m.set_word("t1", Some("idle".into()), None, false);
+        m.set_turn("t1", 4, Some(4));
+        assert_eq!(m.status("t1"), Some("idle"));
+        // Needing you or working beats seen.
+        m.set_word("t1", Some("blocked".into()), None, false);
+        assert_eq!(m.status("t1"), Some("blocked"));
+        // No label: this screen's own rule.
+        m.set_word("t1", Some("idle".into()), None, false);
+        m.set_turn("t1", 5, None);
+        assert_eq!(m.status("t1"), Some("done"));
+    }
+
+    #[test]
     fn focus_follows_panes_across_tabs_and_spaces() {
         let mut m = model_with_one();
         m.add_tab("p1", Tab::new("c2", "b", "x2", "t2"));
@@ -836,6 +876,6 @@ mod tests {
         assert!(m.focus_pane("x1"));
         assert_eq!(m.active.as_deref(), Some("p1"));
         assert_eq!(m.focused_pane().as_deref(), Some("x1"));
-        assert_eq!(m.visible_addresses(), ["t1"]);
+        assert_eq!(m.active_tab().map(|c| addresses(c.shown())).unwrap_or_default(), ["t1"]);
     }
 }

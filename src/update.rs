@@ -160,6 +160,7 @@ pub fn start() {
         return;
     }
     RUNNING.store(true, Ordering::Relaxed);
+    CHECKING.store(true, Ordering::Relaxed);
     std::thread::spawn(move || {
         sleep(Duration::from_secs(10));
         loop {

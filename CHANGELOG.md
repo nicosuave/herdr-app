@@ -1,5 +1,20 @@
 # Herdr changelog
 
+## [0.1.11] - 2026-10-31
+
+### Fixed
+- The window no longer freezes or spikes the CPU for seconds at a time while mods run.
+- Programs get the new colors right away when you change the theme or switch light and dark. (#122, thanks @geoqiao)
+- On macOS, Vietnamese input methods like OpenKey, DauKey and Gõ Nhanh type in terminals. (#230, thanks @emizuki)
+- Links a program breaks across lines open with Cmd+click. (thanks @pdeveltere)
+- Editing the theme you're using repaints the window. (thanks @shawnyeager)
+- Mod tooltips show in embedded windows. (thanks @ruilopesm)
+- Opening the palette or a popup again closes it instead of stacking another. (#151, thanks @ruttybob)
+- The status bar shows your real palette key. (#150, thanks @ruttybob)
+- The Go-to popup keeps the selected row in view. (#152, thanks @ruttybob)
+- No empty strip under the agents list in a wide sidebar. (thanks @kaofelix)
+- A failed update check no longer says "Up to date". (#186, thanks @weichieh0204)
+
 ## [0.1.10] - 2026-10-30
 
 ### Fixed

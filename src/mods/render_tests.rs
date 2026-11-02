@@ -278,6 +278,19 @@ fn shipped_initial_descriptions(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn brand_leaves_room_for_macos_traffic_lights_only_outside_full_screen(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for (fullscreen, inset) in [(false, true), (true, false)] {
+        let mut values = fixture(true, props(), updates("current", "current"));
+        values.insert("window".into(), json!({"platform":"macos","titlebar":"none","fullscreen":fullscreen,"buttons":false}));
+        let tree = describe_with_values(cx, &staged, "mods/workspace-chrome", values, None).unwrap();
+        let root = tree.lines().next().unwrap();
+        assert_eq!(root.contains(".pl[Number(76.0)]"), inset, "fullscreen={fullscreen}: {tree}");
+    }
+}
+
+#[gpui::test]
 fn tabs_leave_room_for_macos_traffic_lights(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let staged = Staged::new();
@@ -372,6 +385,28 @@ fn check_materializes_retained_elements_in_a_rendered_view(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+fn rebuilt_machine_offers_connect_only_for_identity_mismatch(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for (state, why, offered) in [
+        ("unreachable", "a different core answers there (\"new-id\")", true),
+        ("unreachable", "connection refused", false),
+        ("unreachable", "a different core answers there", false),
+        ("connected", "a different core answers there (\"new-id\")", false),
+    ] {
+        let setup = format!(
+            "this.machines = [{{name:'cloud', state:{}, why:{}, target:'host'}}]; this.folded.add('cloud');",
+            json!(state), json!(why)
+        );
+        let tree = describe(cx, &staged, "mods/spaces", false, props(), updates("current", "current"), Some(&setup)).unwrap();
+        assert_eq!(tree.contains("machine-connect-cloud"), offered, "{state}/{why}: {tree}");
+        assert_eq!(tree.contains("rebuilt ·"), offered, "{tree}");
+        assert_eq!(tree.contains("This machine was rebuilt or replaced. Click to connect to the new one."), offered, "{tree}");
+        assert!(!tree.contains("machine-reconnect-"), "reconnect belongs in the machine row: {tree}");
+    }
+}
+
+#[gpui::test]
 fn machine_picker_keeps_long_lists_scrollable(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let staged = Staged::new();
@@ -408,6 +443,23 @@ fn machine_setup_prompt_stacks_above_the_picker(cx: &mut TestAppContext) {
     assert_eq!(spec["kind"], "dialog");
     assert_eq!(spec["layout"]["children"][1]["content"]["terminal"], "t-setup");
     assert!(!calls.effects.iter().any(|(name, _)| name == "closeOverlay"), "the picker must keep monitoring setup");
+}
+
+#[gpui::test]
+fn option_key_settings_are_only_shown_on_macos(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for platform in ["linux", "windows", "macos"] {
+        let mut p = props();
+        p["section"] = json!("keyboard");
+        let mut values = fixture(true, p, updates("current", "current"));
+        values.insert("window".into(), json!({"platform":platform}));
+        let tree = describe_with_values(cx, &staged, "frame/settings", values, None).unwrap();
+        for value in ["auto", "on", "off", "left", "right"] {
+            assert_eq!(tree.contains(&format!("st-option-{value}")), platform == "macos", "{platform}: {tree}");
+        }
+        assert_eq!(tree.contains("st-s-keyboard"), platform == "macos", "{platform}: {tree}");
+    }
 }
 
 #[gpui::test]
@@ -698,6 +750,26 @@ fn shipped_layouts_and_keys() {
             }
         }
     }
+}
+
+#[gpui::test]
+fn picker_scrolls_the_selection_into_view(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let mut values = fixture(true, props(), updates("current", "current"));
+    let tabs: Vec<Value> = (1..=12)
+        .map(|i| json!({"id":format!("tab{i}"),"index":i,"name":format!("Task {i}"),"active":i==1,"status":"done","panes":1,"zoomed":false,"settled":false,"settled_at":null,"changed_at":null,"working_since":null}))
+        .collect();
+    values.insert("spaces".into(), json!([
+        {"id":"s1","index":1,"name":"Local","folder":"/fixture/project","machine":null,"branch":"main","active":true,"status":"working","tabs":tabs}
+    ]));
+    // Selecting the last row (with the arrows) must scroll it into the visible 320px.
+    let tree = describe_with_values(cx, &staged, "mods/picker", values, Some("this.at = 999; cx.notify();")).unwrap();
+    let top = tree.lines()
+        .find(|l| l.contains("pk-space-here"))
+        .unwrap_or_else(|| panic!("selected row missing: {tree}"));
+    let px: f64 = top.split(".top[Number(").nth(1).unwrap_or_else(|| panic!("selected row must be placed inside the scrolled list: {tree}")).split(")").next().unwrap().parse().unwrap();
+    assert!(px <= 320.0 - 32.0, "selected row at {px}px is below the visible list: {tree}");
 }
 
 #[gpui::test]

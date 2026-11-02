@@ -22,6 +22,7 @@ mod mods;
 mod mod_files;
 mod process_cwd;
 mod programs;
+mod remote_shell;
 #[cfg(unix)]
 mod rex;
 mod settings;

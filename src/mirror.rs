@@ -97,7 +97,9 @@ impl Document {
                 .map(|s| SharedSpace {
                     id: map(&s.id),
                     name: s.name.clone(),
-                    folder: s.folder.clone(),
+                    // A space adopted before its core knew a folder ("") takes
+                    // its live one, so the empty folder doesn't outlive it.
+                    folder: if s.folder.is_empty() { model.space_folder(s) } else { s.folder.clone() },
                     tabs: s
                         .tabs
                         .iter()
@@ -302,6 +304,14 @@ mod tests {
         assert_eq!(doc.spaces[0].tabs[0].name, "");
         assert!(doc.spaces[0].tabs[0].root.children().is_empty());
         assert_eq!(serde_json::from_value::<Document>(serde_json::json!({})).unwrap(), Document::default());
+    }
+
+    #[test]
+    fn a_space_without_a_folder_takes_its_live_one() {
+        let mut m = model();
+        m.space_mut("s").unwrap().folder = "".into();
+        m.pane_folders.insert("p".into(), "/src/notes".into());
+        assert_eq!(Document::capture(&m, None).spaces[0].folder, "/src/notes");
     }
     #[test]
     fn machine_blocks_are_deterministic_and_moves_stay_inside_them() {

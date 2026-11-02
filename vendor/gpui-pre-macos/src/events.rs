@@ -21,11 +21,31 @@ use std::{borrow::Cow, cell::Cell, ffi::c_void};
 
 thread_local! {
     // Other GPUI consumers retain native Option behavior unless they opt in.
-    static OPTION_AS_ALT: Cell<Option<bool>> = const { Cell::new(Some(false)) };
+    static OPTION_AS_ALT: Cell<Option<OptionAsAlt>> = const { Cell::new(Some(OptionAsAlt::None)) };
 }
 
-/// `None` follows the keyboard layout; `Some` forces Alt or native Option.
-pub fn set_option_as_alt(value: Option<bool>) {
+/// Which Option keys act as terminal Alt rather than native text input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptionAsAlt {
+    None,
+    Both,
+    Left,
+    Right,
+}
+
+impl OptionAsAlt {
+    pub fn uses_alt(self, side: Option<gpui::OptionSide>) -> bool {
+        match self {
+            Self::None => false,
+            Self::Both => true,
+            Self::Left => matches!(side, Some(gpui::OptionSide::Left | gpui::OptionSide::Both)),
+            Self::Right => matches!(side, Some(gpui::OptionSide::Right | gpui::OptionSide::Both)),
+        }
+    }
+}
+
+/// `None` follows the keyboard layout; `Some` selects the Option keys to use as Alt.
+pub fn set_option_as_alt(value: Option<OptionAsAlt>) {
     OPTION_AS_ALT.set(value);
 }
 
@@ -34,18 +54,28 @@ fn layout_uses_option_as_alt(id: &str) -> bool {
 }
 
 /// Resolved against the current layout so input-source switches take effect immediately.
-pub fn option_as_alt() -> bool {
+pub fn option_as_alt() -> OptionAsAlt {
     OPTION_AS_ALT.get().unwrap_or_else(|| unsafe {
         // The active source, not an IME's underlying ASCII keyboard layout.
         let source = TISCopyCurrentKeyboardInputSource();
         if source.is_null() {
-            return false;
+            return OptionAsAlt::None;
         }
         let id = TISGetInputSourceProperty(source, kTISPropertyInputSourceID as *const c_void);
         let enabled = !id.is_null() && layout_uses_option_as_alt(id.to_str());
         let _: () = msg_send![source, release];
-        enabled
+        if enabled { OptionAsAlt::Both } else { OptionAsAlt::None }
     })
+}
+
+fn option_side(modifiers: NSEventModifierFlags) -> Option<gpui::OptionSide> {
+    // NX_DEVICELALTKEYMASK and NX_DEVICERALTKEYMASK from IOLLEvent.h.
+    match (modifiers.bits() & 0x20 != 0, modifiers.bits() & 0x40 != 0) {
+        (true, true) => Some(gpui::OptionSide::Both),
+        (true, false) => Some(gpui::OptionSide::Left),
+        (false, true) => Some(gpui::OptionSide::Right),
+        (false, false) => None,
+    }
 }
 
 const BACKSPACE_KEY: u16 = 0x7f;
@@ -489,7 +519,7 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
                 // Fn can accompany printable keys from programmable keyboards.
                 if !control && !command {
                     let caps_lock = modifiers.contains(NSEventModifierFlags::NSAlphaShiftKeyMask);
-                    let mods = text_modifiers(shift, alt && !option_as_alt(), caps_lock);
+                    let mods = text_modifiers(shift, alt && !option_as_alt().uses_alt(option_side(modifiers)), caps_lock);
 
                     // Keep dead keys for NSTextInputClient instead of sending their
                     // spacing accent to key-down listeners before composition starts.
@@ -532,6 +562,7 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
             key,
             key_char,
             unshifted_key,
+            option_side: option_side(modifiers),
         }
     }
 }
@@ -699,7 +730,7 @@ mod tests {
     fn shifted_alias_preserves_text_and_other_modifiers() {
         use gpui::KeybindingKeystroke;
         let _guard = NATIVE_KEY_TEST.lock().unwrap();
-        set_option_as_alt(Some(false));
+        set_option_as_alt(Some(OptionAsAlt::None));
         for code in [30, 33, 24, 27] {
             let event = native_key(code, NSEventModifierFlags::NSShiftKeyMask);
             let text = translate_key(code, SHIFT_MOD, false);
@@ -735,11 +766,45 @@ mod tests {
 
     #[test]
     fn explicit_option_as_alt_overrides_layout_detection() {
-        for value in [false, true] {
+        for value in [OptionAsAlt::None, OptionAsAlt::Both, OptionAsAlt::Left, OptionAsAlt::Right] {
             set_option_as_alt(Some(value));
             assert_eq!(option_as_alt(), value);
         }
-        set_option_as_alt(Some(false));
+        set_option_as_alt(Some(OptionAsAlt::None));
+    }
+
+    #[test]
+    fn option_sides_control_text_without_changing_shortcuts() {
+        use gpui::{KeybindingKeystroke, OptionSide};
+        let _guard = NATIVE_KEY_TEST.lock().unwrap();
+        let alt = NSEventModifierFlags::NSAlternateKeyMask;
+        for (bits, side) in [(0, None), (0x20, Some(OptionSide::Left)), (0x40, Some(OptionSide::Right)), (0x60, Some(OptionSide::Both))] {
+            let flags = alt | NSEventModifierFlags::from_bits_retain(bits);
+            assert_eq!(option_side(flags), side);
+            for setting in [OptionAsAlt::None, OptionAsAlt::Both, OptionAsAlt::Left, OptionAsAlt::Right] {
+                set_option_as_alt(Some(setting));
+                let as_alt = match setting {
+                    OptionAsAlt::None => false,
+                    OptionAsAlt::Both => true,
+                    OptionAsAlt::Left => bits & 0x20 != 0,
+                    OptionAsAlt::Right => bits & 0x40 != 0,
+                };
+                assert_eq!(setting.uses_alt(side), as_alt);
+                for code in [0x23, 0x0e] { // P and the E dead key on US layouts.
+                    let event = native_key(code, flags);
+                    assert_eq!(event.option_side, side);
+                    let text = translate_key(code, if as_alt { NO_MOD } else { OPTION_MOD }, false);
+                    assert_eq!(event.key_char, (!text.is_empty()).then_some(text));
+                    let target = KeybindingKeystroke::from_keystroke(Keystroke::parse(&format!("alt-{}", event.key)).unwrap());
+                    assert!(event.should_match(&target));
+                    let mut other = event.clone();
+                    other.option_side = None;
+                    assert_eq!(event, other);
+                    assert_eq!(gpui::hash(&event), gpui::hash(&other));
+                }
+            }
+        }
+        set_option_as_alt(Some(OptionAsAlt::None));
     }
 
     #[test]
@@ -767,7 +832,7 @@ mod tests {
     #[test]
     fn typed_text_keeps_its_key_char() {
         let _guard = NATIVE_KEY_TEST.lock().unwrap();
-        set_option_as_alt(Some(false));
+        set_option_as_alt(Some(OptionAsAlt::None));
         for (flags, mods) in [
             (NSEventModifierFlags::empty(), NO_MOD),
             (NSEventModifierFlags::NSShiftKeyMask, SHIFT_MOD),
@@ -786,8 +851,8 @@ mod tests {
         let own = translate_key(0x00, NO_MOD, false);
         assert_eq!(native_key_with_text(0x00, NSEventModifierFlags::empty(), "").key_char, Some(own.clone()));
         // Option as Alt drops Option from the key's text but not from the event's characters.
-        set_option_as_alt(Some(true));
+        set_option_as_alt(Some(OptionAsAlt::Both));
         assert_eq!(native_key_with_text(0x00, NSEventModifierFlags::NSAlternateKeyMask, "å").key_char, Some(own));
-        set_option_as_alt(Some(false));
+        set_option_as_alt(Some(OptionAsAlt::None));
     }
 }

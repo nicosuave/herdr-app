@@ -476,8 +476,11 @@ impl Bridge {
         let mut record = new_record(&known, block);
         record["title"] = json!(call("title")["title"].as_str().unwrap_or_default());
         let process = call("process");
-        record["cwd"] = json!(process["child"]["cwd"].as_str().or(process["foreground"]["cwd"].as_str()).unwrap_or_default());
-        record["pid"] = process["child"]["pid"].clone();
+        // A block still starting reports neither, and an empty folder would
+        // spread to its space and the mods that run programs there: Rex's home
+        // is the folder such a shell starts in.
+        record["cwd"] = json!(process_cwd(&process));
+        record["pid"] = if process["child"]["pid"].is_null() { process["foreground"]["pid"].clone() } else { process["child"]["pid"].clone() };
         record["foreground"] = foreground(&process["foreground"]);
         if let Some(code) = process["last_exit"]["exit_code"].as_i64() {
             record["state"] = json!("finished");
@@ -1028,6 +1031,15 @@ fn foreground(fg: &Value) -> Value {
     })
 }
 
+/// A block's folder: what runs there, else where Rex says its home is.
+fn process_cwd(process: &Value) -> &str {
+    process["child"]["cwd"]
+        .as_str()
+        .or(process["foreground"]["cwd"].as_str())
+        .or(process["home"].as_str())
+        .unwrap_or_default()
+}
+
 /// Rex program status records (OSC 7501, as herdr's) into the record's
 /// `status` (the root record) and `records` (the rest).
 fn apply_status(t: &mut Term) {
@@ -1122,5 +1134,16 @@ mod tests {
         let fg = foreground(&json!({"pid": 9, "name": "node", "script": "/usr/lib/node_modules/x/cli.js", "argv0": "node", "cwd": "/src"}));
         assert_eq!(fg, json!({"pid": 9, "name": "cli.js", "argv": ["node"], "cwd": "/src"}));
         assert_eq!(foreground(&Value::Null), Value::Null);
+    }
+
+    #[test]
+    fn a_block_that_has_not_started_still_has_a_folder() {
+        let running = json!({"child": {"cwd": "/work"}, "foreground": {"cwd": "/src"}, "home": "/home/a"});
+        assert_eq!(process_cwd(&running), "/work", "the shell's folder, as herdr's record has it");
+        assert_eq!(process_cwd(&json!({"foreground": {"cwd": "/src"}, "home": "/home/a"})), "/src");
+        // Rex says this before the shell is up: not "", which a space would
+        // take as its folder and mods would try to run programs in.
+        assert_eq!(process_cwd(&json!({"home": "/home/a"})), "/home/a");
+        assert_eq!(process_cwd(&json!({})), "");
     }
 }

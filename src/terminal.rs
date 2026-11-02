@@ -99,7 +99,7 @@ pub struct TerminalView {
     /// When the person last typed here: output right after is shown at once.
     typed_at: Cell<Option<Instant>>,
     /// Scrolled this gesture, in lines, toward the next whole one.
-    scrolled: f32,
+    scrolled: Point<f32>,
     _reader: Option<Task<()>>,
 }
 
@@ -207,7 +207,7 @@ impl TerminalView {
             was_focused: false,
             shown_in: Cell::new(0),
             typed_at: Cell::new(None),
-            scrolled: 0.0,
+            scrolled: point(0.0, 0.0),
             _reader: None,
         };
         view.connect(core, false, cx);
@@ -244,8 +244,6 @@ impl TerminalView {
             g.vt_cell = cell;
             g.told_display = None;
             let facts = display_update(&mut g.told_display, &vt::theme(), cell).unwrap();
-            // Addresses on other machines are `machine/tN`.
-            g.vt.allow_local_image_files(!self.address.contains('/'));
             g.core = core.clone();
             g.channel = None;
             (cols, rows, facts)
@@ -553,27 +551,20 @@ impl TerminalView {
     fn scroll(&mut self, ev: &ScrollWheelEvent, _w: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         let mut g = self.grid.borrow_mut();
-        let rows = g.vt.rows as f32;
-        let steps = match ev.delta {
-            ScrollDelta::Lines(p) if cfg!(target_os = "macos") => macos_wheel_steps(p.y),
-            ScrollDelta::Lines(p) => scroll_steps(&mut self.scrolled, ev.touch_phase, p.y, rows),
-            ScrollDelta::Pixels(p) => scroll_steps(&mut self.scrolled, ev.touch_phase, p.y / g.cell.height, rows),
-        };
-        let n = steps.unsigned_abs() as usize;
-        if n == 0 {
+        let steps = scroll_delta_steps(&mut self.scrolled, ev.delta, ev.touch_phase, g.cell, g.vt.cols, g.vt.rows);
+        let n = steps.y.unsigned_abs() as usize;
+        if steps.x == 0 && n == 0 {
             return;
         }
-        let up = steps > 0;
+        let up = steps.y > 0;
         if g.vt.mouse_tracking() {
             let ((x, y), size) = mouse_at(&g, ev.position);
-            let button = if up { GHOSTTY_MOUSE_BUTTON_FOUR } else { GHOSTTY_MOUSE_BUTTON_FIVE };
-            let mut out = Vec::new();
-            for _ in 0..n {
-                out.extend(g.vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(button), 0, x, y, size, false));
-            }
+            let out = scroll_mouse_bytes(&mut g.vt, steps, x, y, size);
             if let Some(ch) = g.channel {
                 g.core.input(ch, &out);
             }
+        } else if n == 0 {
+            return;
         } else if g.vt.alt_screen() {
             let key = if up { GHOSTTY_KEY_ARROW_UP } else { GHOSTTY_KEY_ARROW_DOWN };
             let mut out = Vec::new();
@@ -794,6 +785,30 @@ fn local(g: &Grid, p: Point<Pixels>) -> (f32, f32) {
     (f32::from(p.x - g.origin.x).max(0.0), f32::from(p.y - g.origin.y).max(0.0))
 }
 
+fn scroll_delta_steps(scrolled: &mut Point<f32>, delta: ScrollDelta, phase: TouchPhase, cell: Size<Pixels>, cols: u16, rows: u16) -> Point<i32> {
+    let lines = match delta {
+        // As in Ghostty, a sideways notch moves one column; a vertical one, three lines.
+        ScrollDelta::Lines(p) if cfg!(target_os = "macos") => return point(macos_wheel_steps(p.x) / 3, macos_wheel_steps(p.y)),
+        ScrollDelta::Lines(p) => p,
+        ScrollDelta::Pixels(p) => point(p.x / cell.width, p.y / cell.height),
+    };
+    point(scroll_steps(&mut scrolled.x, phase, lines.x, cols as f32), scroll_steps(&mut scrolled.y, phase, lines.y, rows as f32))
+}
+
+fn scroll_mouse_bytes(vt: &mut Vt, steps: Point<i32>, x: f32, y: f32, size: (u32, u32, f32, f32)) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (steps, positive, negative) in [
+        (steps.y, GHOSTTY_MOUSE_BUTTON_FOUR, GHOSTTY_MOUSE_BUTTON_FIVE),
+        (steps.x, GHOSTTY_MOUSE_BUTTON_SIX, GHOSTTY_MOUSE_BUTTON_SEVEN),
+    ] {
+        let button = if steps > 0 { positive } else { negative };
+        for _ in 0..steps.unsigned_abs() {
+            out.extend(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(button), 0, x, y, size, false));
+        }
+    }
+    out
+}
+
 /// Whole lines to scroll for one scroll event. A touchpad sends many small
 /// moves: they add up to a line before one scrolls (as in Zed), and each
 /// gesture starts from nothing. Kept under a screen, so turning back is quick.
@@ -859,11 +874,20 @@ fn icon_glyph(c: char) -> Option<IconGlyph> {
     })
 }
 
-/// A Nerd Font icon (Unicode private use areas). Drawn from the bundled
-/// symbols font and fitted to the cell, whatever the terminal font.
+/// A Nerd Font icon (Unicode private use areas).
 fn is_icon(text: &str) -> bool {
     let mut chars = text.chars();
     matches!((chars.next(), chars.next()), (Some(c), None) if matches!(c as u32, 0xE000..=0xF8FF | 0xF0000..=0x10FFFD))
+}
+
+/// Keep the configured font’s icon proportions; only fit bundled fallback glyphs.
+fn fallback_icon(text: &str, font: &Font, ts: &gpui::TextSystem) -> Option<IconGlyph> {
+    let c = text.chars().next().filter(|_| is_icon(text))?;
+    let id = ts.resolve_font(font);
+    if ts.advance(id, px(crate::settings::font_size()), c).is_ok() {
+        return None;
+    }
+    icon_glyph(c)
 }
 
 fn paste_image_fallback(vt: &mut vt::Vt, text: Option<&str>) -> Option<Vec<u8>> {
@@ -886,8 +910,14 @@ fn key_bytes(vt: &mut vt::Vt, ev: &KeyDownEvent) -> Option<Vec<u8>> {
     }
     let k = &ev.keystroke;
     let m = k.modifiers;
-    if k.key == "enter" && vt.win32.on && (m.shift || m.control || m.alt) && vt.kitty_keyboard_flags() == 0 {
-        return Some(crate::win32_keys::enter(m.shift, m.control, m.alt));
+    if vt.win32.on && vt.kitty_keyboard_flags() == 0 {
+        if k.key == "enter" && (m.shift || m.control || m.alt) {
+            return Some(crate::win32_keys::enter(m.shift, m.control, m.alt));
+        }
+        // ConPTY combines a bare Escape with the next key as an Alt chord.
+        if k.key == "escape" {
+            return Some(crate::win32_keys::escape(m.shift, m.control, m.alt));
+        }
     }
     let Some((key, shifted, unshifted)) = map_key(&k.key) else {
         return k.key_char.as_ref().map(|text| text.as_bytes().to_vec());
@@ -901,6 +931,12 @@ fn key_bytes(vt: &mut vt::Vt, ev: &KeyDownEvent) -> Option<Vec<u8>> {
     }
     if m.alt {
         mods |= GHOSTTY_MODS_ALT as GhosttyMods;
+        #[cfg(target_os = "macos")]
+        if k.option_side == Some(gpui::OptionSide::Right)
+            || (k.option_side == Some(gpui::OptionSide::Both) && gpui_macos::option_as_alt() == gpui_macos::OptionAsAlt::Right)
+        {
+            mods |= GHOSTTY_MODS_ALT_SIDE as GhosttyMods;
+        }
     }
     if m.platform {
         mods |= GHOSTTY_MODS_SUPER as GhosttyMods;
@@ -915,7 +951,7 @@ fn key_bytes(vt: &mut vt::Vt, ev: &KeyDownEvent) -> Option<Vec<u8>> {
     let mut consumed = mods & GHOSTTY_MODS_SHIFT as GhosttyMods;
     let option_as_alt = {
         #[cfg(target_os = "macos")]
-        { gpui_macos::option_as_alt() }
+        { gpui_macos::option_as_alt().uses_alt(k.option_side) }
         #[cfg(not(target_os = "macos"))]
         { false }
     };
@@ -1049,8 +1085,9 @@ fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, window: &mut Window) -> Vec<Row
             ops.push(RowOp::Sprite { x: start, text: c.text.clone(), color });
             continue;
         }
-        if let Some(icon) = c.text.chars().next().filter(|_| is_icon(&c.text)).and_then(icon_glyph) {
-            // Fitted to the cell by its real outline, as Ghostty does:
+        let text_font = cell_font(c.bold, c.italic);
+        if let Some(icon) = fallback_icon(&c.text, &text_font, window.text_system()) {
+            // Fit missing icons from the bundled font by their outlines:
             // centered, as tall as fits, two cells wide when a space
             // follows (prompts, statuslines, file trees).
             let room = if row.get(x).is_none_or(|d| d.text.trim().is_empty()) { 2.0 } else { 1.0 };
@@ -1079,8 +1116,8 @@ fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, window: &mut Window) -> Vec<Row
                     && d.faint == c.faint
                     && d.underline == c.underline
                     && d.strike == c.strike;
-                // A missing icon breaks the run too; the next outer pass draws it as text.
-                if !same || (d.text.is_empty() && !d.underline && !d.strike) || crate::sprites::is_sprite(&d.text) || is_icon(&d.text) {
+                // Bundled fallback icons are fitted separately from the text run.
+                if !same || (d.text.is_empty() && !d.underline && !d.strike) || crate::sprites::is_sprite(&d.text) || fallback_icon(&d.text, &text_font, window.text_system()).is_some() {
                     break;
                 }
                 text.push_str(if d.text.is_empty() { " " } else { &d.text });
@@ -1092,7 +1129,7 @@ fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, window: &mut Window) -> Vec<Row
         }
         let run = TextRun {
             len: text.len(),
-            font: cell_font(c.bold, c.italic),
+            font: text_font,
             color,
             background_color: None,
             underline: c.underline.then(|| UnderlineStyle { thickness: px(1.0), color: Some(color), wavy: false }),
@@ -1574,7 +1611,8 @@ mod tests {
                             _ => None,
                         }).collect();
                         assert!(rendered.contains(missing), "{text:?}, underline={underline}, strike={strike}");
-                        assert!(ops.iter().any(|op| matches!(op, super::RowOp::Icon { .. })));
+                        assert!(rendered.contains('\u{f10d}'));
+                        assert!(!ops.iter().any(|op| matches!(op, super::RowOp::Icon { .. })));
                         let positions: Vec<_> = ops.iter().filter_map(|op| match op {
                             super::RowOp::Text { x, line } => { assert!(!line.text.is_empty()); Some(*x) }
                             super::RowOp::Icon { x, .. } => Some(*x),
@@ -1582,6 +1620,26 @@ mod tests {
                         }).collect();
                         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
                     }
+                }
+            }
+        }).unwrap();
+    }
+
+    #[gpui::test]
+    fn icons_available_in_the_terminal_font_stay_in_one_text_run(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        window.update(cx, |_, window, _| {
+            // The test text system supplies every glyph in the requested font.
+            for (bold, italic) in [(false, false), (true, false), (false, true)] {
+                for text in ["\u{f1c0}\u{f0e7} 99.6%", "\u{f0e4} 54 t/s", "\u{f233} \u{f0e7}"] {
+                    let row: Vec<_> = text.chars().map(|c| crate::vt::Cell {
+                        text: c.to_string(), bold, italic, ..Default::default()
+                    }).collect();
+                    let ops = super::row_ops(&row, gpui::size(gpui::px(8.0), gpui::px(16.0)), window);
+                    assert_eq!(ops.len(), 1, "{text:?}");
+                    let super::RowOp::Text { x, line } = &ops[0] else { panic!("configured font was bypassed") };
+                    assert_eq!(*x, 0);
+                    assert_eq!(line.text.as_ref(), text);
                 }
             }
         }).unwrap();
@@ -1656,6 +1714,43 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_and_vertical_scroll_report_sgr_wheel_buttons() {
+        use gpui::{point, px, size, ScrollDelta, TouchPhase};
+        let mut vt = Vt::new(80, 24);
+        vt.write(b"\x1b[?1000h\x1b[?1006h");
+        let cell = size(px(10.0), px(20.0));
+        let mut scrolled = point(0.0, 0.0);
+        for (delta, expected) in [
+            (point(10.0, 0.0), b"\x1b[<66;2;2M".as_slice()),
+            (point(-10.0, 0.0), b"\x1b[<67;2;2M".as_slice()),
+            (point(0.0, 20.0), b"\x1b[<64;2;2M".as_slice()),
+            (point(0.0, -20.0), b"\x1b[<65;2;2M".as_slice()),
+            (point(-10.0, 20.0), b"\x1b[<64;2;2M\x1b[<67;2;2M".as_slice()),
+        ] {
+            let steps = super::scroll_delta_steps(&mut scrolled, ScrollDelta::Pixels(point(px(delta.x), px(delta.y))), TouchPhase::Moved, cell, 80, 24);
+            assert_eq!(super::scroll_mouse_bytes(&mut vt, steps, 15.0, 25.0, (80, 24, 10.0, 20.0)), expected);
+        }
+        let steps = super::scroll_delta_steps(&mut scrolled, ScrollDelta::Lines(point(1.0, -1.0)), TouchPhase::Moved, cell, 80, 24);
+        let count = if cfg!(target_os = "macos") { 3 } else { 1 };
+        assert_eq!(steps, point(1, -count));
+        assert_eq!(super::scroll_mouse_bytes(&mut vt, steps, 15.0, 25.0, (80, 24, 10.0, 20.0)), [b"\x1b[<65;2;2M".repeat(count as usize), b"\x1b[<66;2;2M".to_vec()].concat());
+    }
+
+    #[test]
+    fn scroll_axes_accumulate_independently_and_reset_together() {
+        use gpui::{point, px, size, ScrollDelta, TouchPhase::*};
+        let mut scrolled = point(0.0, 0.0);
+        let mut steps = |phase, x, y| super::scroll_delta_steps(&mut scrolled, ScrollDelta::Pixels(point(px(x), px(y))), phase, size(px(10.0), px(20.0)), 80, 24);
+        assert_eq!(steps(Moved, 6.0, 8.0), point(0, 0));
+        assert_eq!(steps(Moved, 5.0, 8.0), point(1, 0));
+        assert_eq!(steps(Moved, 0.0, 8.0), point(0, 1));
+        assert_eq!(steps(Started, 0.0, 0.0), point(0, 0));
+        assert_eq!(steps(Moved, -9.0, -19.0), point(0, 0));
+        assert_eq!(steps(Moved, -2.0, -2.0), point(-1, -1));
+        assert_eq!(steps(Ended, 100.0, 100.0), point(0, 0));
+    }
+
+    #[test]
     fn macos_wheel_events_scroll_as_in_ghostty() {
         use super::macos_wheel_steps as steps;
         assert_eq!(steps(0.1), 3, "a slow notch");
@@ -1701,6 +1796,8 @@ mod tests {
                 key_char: typed.map(str::to_owned),
                 #[cfg(target_os = "macos")]
                 unshifted_key: None,
+                #[cfg(target_os = "macos")]
+                option_side: None,
             },
             is_held: false,
             prefer_character_input: false,
@@ -1726,7 +1823,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn option_as_alt_encodes_legacy_and_kitty_shortcuts() {
         let _guard = OPTION_AS_ALT_TEST_LOCK.lock().unwrap();
-        gpui_macos::set_option_as_alt(Some(true));
+        gpui_macos::set_option_as_alt(Some(gpui_macos::OptionAsAlt::Both));
         let mut vt = Vt::new(20, 3);
         for (key, text, bytes) in [("alt-p", "p", b"\x1bp"), ("alt-e", "e", b"\x1be"), ("alt-b", "b", b"\x1bb")] {
             assert_eq!(key_bytes(&mut vt, &press(key, Some(text))).unwrap(), bytes);
@@ -1734,7 +1831,7 @@ mod tests {
         vt.write(b"\x1b[>1u");
         assert_eq!(key_bytes(&mut vt, &press("alt-e", Some("e"))).unwrap(), b"\x1b[101;3u");
         vt.write(b"\x1b[<u");
-        gpui_macos::set_option_as_alt(Some(false));
+        gpui_macos::set_option_as_alt(Some(gpui_macos::OptionAsAlt::None));
         assert_eq!(key_bytes(&mut vt, &press("alt-p", Some("π"))).unwrap(), "π".as_bytes());
         for setup in [b"".as_slice(), b"\x1b[>1u"] {
             let mut vt = Vt::new(20, 3);
@@ -1748,6 +1845,40 @@ mod tests {
             }
             assert_eq!(key_bytes(&mut vt, &press("alt-left", None)).unwrap(), b"\x1b[1;3D");
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn option_sides_encode_shortcuts_and_native_text() {
+        use gpui::OptionSide;
+        use gpui_macos::OptionAsAlt;
+        let _guard = OPTION_AS_ALT_TEST_LOCK.lock().unwrap();
+        for setting in [OptionAsAlt::Left, OptionAsAlt::Right] {
+            gpui_macos::set_option_as_alt(Some(setting));
+            for side in [OptionSide::Left, OptionSide::Right, OptionSide::Both] {
+                let as_alt = side == OptionSide::Both || matches!((setting, side), (OptionAsAlt::Left, OptionSide::Left) | (OptionAsAlt::Right, OptionSide::Right));
+                for kitty in [false, true] {
+                    let mut vt = Vt::new(20, 3);
+                    if kitty { vt.write(b"\x1b[>1u"); }
+                    for native in ["π", "@"] {
+                        let mut event = press("alt-p", Some(if as_alt { "p" } else { native }));
+                        event.keystroke.option_side = Some(side);
+                        let expected = if as_alt {
+                            if kitty { b"\x1b[112;3u".as_slice() } else { b"\x1bp".as_slice() }
+                        } else { native.as_bytes() };
+                        assert_eq!(key_bytes(&mut vt, &event).unwrap(), expected);
+                        // Shortcut-prefix replay must retain the original Option side.
+                        let mut replay = event.clone();
+                        replay.prefer_character_input = true;
+                        assert_eq!(key_bytes(&mut vt, &replay).unwrap(), expected);
+                    }
+                    let mut arrow = press("alt-left", None);
+                    arrow.keystroke.option_side = Some(side);
+                    assert_eq!(key_bytes(&mut vt, &arrow).unwrap(), b"\x1b[1;3D");
+                }
+            }
+        }
+        gpui_macos::set_option_as_alt(Some(OptionAsAlt::None));
     }
 
     #[test]
@@ -1785,7 +1916,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         let _guard = OPTION_AS_ALT_TEST_LOCK.lock().unwrap();
         #[cfg(target_os = "macos")]
-        gpui_macos::set_option_as_alt(Some(false));
+        gpui_macos::set_option_as_alt(Some(gpui_macos::OptionAsAlt::None));
         // Herdr keeps native Option text on macOS (libghostty's default
         // option-as-alt=false); other platforms prefix an unconsumed Alt.
         const ALT_B: &[u8] = if cfg!(target_os = "macos") { b"b" } else { b"\x1bb" };
@@ -1848,6 +1979,45 @@ mod tests {
     }
 
     #[test]
+    fn escape_keeps_the_next_key_separate_in_each_keyboard_mode() {
+        for flags in [0, 1, 9] {
+            for win32 in [false, true] {
+                let mut vt = Vt::new(20, 3);
+                if win32 { vt.write(b"\x1b[?9001h"); }
+                vt.write(format!("\x1b[>{flags}u").as_bytes());
+                let escape: &[u8] = if flags != 0 {
+                    b"\x1b[27u".as_slice()
+                } else if win32 {
+                    b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_"
+                } else {
+                    b"\x1b"
+                };
+                for (next, text, expected) in [
+                    ("ctrl-c", None, if flags == 0 { b"\x03".as_slice() } else { b"\x1b[99;5u" }),
+                    ("ctrl-c", Some("c"), if flags == 0 { b"\x03".as_slice() } else { b"\x1b[99;5u" }),
+                    ("a", Some("a"), if flags & 8 == 0 { b"a".as_slice() } else { b"\x1b[97u" }),
+                    ("space", Some(" "), if flags & 8 == 0 { b" ".as_slice() } else { b"\x1b[32u" }),
+                    ("escape", None, escape),
+                ] {
+                    assert_eq!(key_bytes(&mut vt, &press("escape", None)).as_deref(), Some(escape), "flags={flags}, win32={win32}");
+                    assert_eq!(key_bytes(&mut vt, &press(next, text)).as_deref(), Some(expected), "flags={flags}, win32={win32}, {next}");
+                }
+                vt.write(b"\x1b[<u");
+                let restored = if win32 { b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_".as_slice() } else { b"\x1b" };
+                assert_eq!(key_bytes(&mut vt, &press("escape", None)).as_deref(), Some(restored));
+                vt.write(b"\x1b[?9001l");
+                assert_eq!(key_bytes(&mut vt, &press("escape", None)).unwrap(), b"\x1b");
+            }
+        }
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"\x1b[?9001h");
+        for (spec, held) in [("shift-escape", 16), ("ctrl-escape", 8), ("alt-escape", 2)] {
+            let expected = format!("\x1b[27;1;27;1;{held};1_\x1b[27;1;27;0;{held};1_");
+            assert_eq!(key_bytes(&mut vt, &press(spec, None)).unwrap(), expected.as_bytes());
+        }
+    }
+
+    #[test]
     fn kitty_input_takes_precedence_over_win32() {
         for flags in 1..=31 {
             for win32_first in [false, true] {
@@ -1856,6 +2026,7 @@ mod tests {
                 vt.write(format!("\x1b[>{flags}u").as_bytes());
                 if !win32_first { vt.write(b"\x1b[?9001h"); }
                 for (spec, expected) in [
+                    ("escape", b"\x1b[27u".as_slice()),
                     ("shift-enter", b"\x1b[13;2u".as_slice()),
                     ("ctrl-enter", b"\x1b[13;5u"),
                     ("alt-enter", b"\x1b[13;3u"),
